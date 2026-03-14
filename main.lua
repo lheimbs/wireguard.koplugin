@@ -428,6 +428,9 @@ function WireGuard:_pickBinary()
         title          = _("Select wireproxy binary"),
         select_directory = false,
         select_file    = true,
+        show_files     = true,
+        show_unsupported = true,
+        file_filter    = function() return true end,
         path           = start_path,
         onConfirm      = function(chosen_path)
             if chosen_path and chosen_path ~= "" then
@@ -449,6 +452,9 @@ function WireGuard:_pickConfig()
         title          = _("Select WireGuard config file"),
         select_directory = false,
         select_file    = true,
+        show_files     = true,
+        show_unsupported = true,
+        file_filter    = function() return true end,
         path           = start_path,
         onConfirm      = function(chosen_path)
             if chosen_path and chosen_path ~= "" then
