@@ -25,6 +25,7 @@ local DataStorage = require("datastorage")
 local logger = require("logger")
 local ffiutil = require("ffi/util")
 local util = require("util")
+local Device = require("device")
 local _ = require("gettext")
 
 -- ---------------------------------------------------------------------------
@@ -404,11 +405,24 @@ end
 -- PathChooser wrappers
 -- ---------------------------------------------------------------------------
 
+local function _getPickerStartPath(saved_path)
+    if saved_path and saved_path ~= "" then
+        local parent = saved_path:match("^(.*)/[^/]+$")
+        if parent and util.pathExists(parent) then
+            return parent
+        end
+    end
+    local home_dir = G_reader_settings:readSetting("home_dir") or Device.home_dir
+    if home_dir and util.pathExists(home_dir) then
+        return home_dir
+    end
+    return DataStorage:getDataDir()
+end
+
 --- Open a PathChooser to let the user select the wireproxy binary.
 function WireGuard:_pickBinary()
-    local start_path = self.wireproxy_binary ~= "" and
-        (self.wireproxy_binary:match("^(.*)/[^/]+$") or "/") or
-        (util.pathExists("/sdcard") and "/sdcard" or "/")
+    local start_path = _getPickerStartPath(self.wireproxy_binary)
+    self:_log("DEBUG", "Opening binary picker at: " .. tostring(start_path))
 
     UIManager:show(PathChooser:new{
         title          = _("Select wireproxy binary"),
@@ -428,9 +442,8 @@ end
 
 --- Open a PathChooser to let the user select the WireGuard .conf file.
 function WireGuard:_pickConfig()
-    local start_path = self.wireguard_config ~= "" and
-        (self.wireguard_config:match("^(.*)/[^/]+$") or "/") or
-        (util.pathExists("/sdcard") and "/sdcard" or "/")
+    local start_path = _getPickerStartPath(self.wireguard_config)
+    self:_log("DEBUG", "Opening config picker at: " .. tostring(start_path))
 
     UIManager:show(PathChooser:new{
         title          = _("Select WireGuard config file"),
