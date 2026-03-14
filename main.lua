@@ -288,7 +288,7 @@ function WireGuard:_startWireproxy()
     -- Launch wireproxy in the background.
     -- The shell writes the PID to PID_FILE and redirects all output to the log.
     local cmd = string.format(
-        "%q -config %q >%q 2>&1 & echo $! >%q",
+        "%q -c %q >%q 2>&1 & echo $! >%q",
         self.wireproxy_binary,
         RUNTIME_CONF_FILE,
         WIREPROXY_LOG_FILE,
