@@ -46,9 +46,8 @@ end)
 local PLUGIN_NAME        = "wireguard"
 local DEFAULT_SOCKS5_PORT = 1080
 
--- Prefer KOReader's own cache directory for temp files so they survive
--- across path changes and are writable on Android.
-local CACHE_DIR          = DataStorage:getCacheDir()
+-- DataStorage does not expose getCacheDir(); cache lives under data dir.
+local CACHE_DIR          = DataStorage:getDataDir() .. "/cache"
 local PID_FILE           = CACHE_DIR .. "/" .. PLUGIN_NAME .. "_wireproxy.pid"
 local RUNTIME_CONF_FILE  = CACHE_DIR .. "/" .. PLUGIN_NAME .. "_wireproxy.conf"
 local WIREPROXY_LOG_FILE = CACHE_DIR .. "/" .. PLUGIN_NAME .. "_wireproxy.log"
