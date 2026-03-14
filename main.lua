@@ -20,6 +20,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local PathChooser = require("ui/widget/pathchooser")
+local FileChooser = require("ui/widget/filechooser")
 local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
 local logger = require("logger")
@@ -419,12 +420,42 @@ local function _getPickerStartPath(saved_path)
     return DataStorage:getDataDir()
 end
 
+local function _showUnfilteredPathChooser(opts)
+    local saved_show_filter = FileChooser.show_filter
+    local restored = false
+    local function restoreFilter()
+        if not restored then
+            FileChooser.show_filter = saved_show_filter
+            restored = true
+        end
+    end
+
+    local onConfirm = opts.onConfirm
+    opts.onConfirm = function(path)
+        restoreFilter()
+        if onConfirm then
+            onConfirm(path)
+        end
+    end
+
+    local close_callback = opts.close_callback
+    opts.close_callback = function(...)
+        restoreFilter()
+        if close_callback then
+            close_callback(...)
+        end
+    end
+
+    FileChooser.show_filter = {}
+    UIManager:show(PathChooser:new(opts))
+end
+
 --- Open a PathChooser to let the user select the wireproxy binary.
 function WireGuard:_pickBinary()
     local start_path = _getPickerStartPath(self.wireproxy_binary)
     self:_log("DEBUG", "Opening binary picker at: " .. tostring(start_path))
 
-    UIManager:show(PathChooser:new{
+    _showUnfilteredPathChooser{
         title          = _("Select wireproxy binary"),
         select_directory = false,
         select_file    = true,
@@ -440,7 +471,7 @@ function WireGuard:_pickBinary()
                 _info(string.format(_("wireproxy binary set to:\n%s"), chosen_path), false, 3)
             end
         end,
-    })
+    }
 end
 
 --- Open a PathChooser to let the user select the WireGuard .conf file.
@@ -448,7 +479,7 @@ function WireGuard:_pickConfig()
     local start_path = _getPickerStartPath(self.wireguard_config)
     self:_log("DEBUG", "Opening config picker at: " .. tostring(start_path))
 
-    UIManager:show(PathChooser:new{
+    _showUnfilteredPathChooser{
         title          = _("Select WireGuard config file"),
         select_directory = false,
         select_file    = true,
@@ -464,7 +495,7 @@ function WireGuard:_pickConfig()
                 _info(string.format(_("WireGuard config set to:\n%s"), chosen_path), false, 3)
             end
         end,
-    })
+    }
 end
 
 --- Show an InputDialog so the user can change the SOCKS5 proxy port.
