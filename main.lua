@@ -288,6 +288,9 @@ function WireGuard:_startWireproxy()
     -- Ensure the installed binary is executable (belt-and-suspenders guard).
     os.execute(string.format("chmod +x %q 2>/dev/null", INSTALLED_BINARY))
 
+    -- Show file permissions
+    os.execute(string.format("ls -ahl %q >%q", INSTALLED_BINARY, WIREPROXY_LOG_FILE))
+
     -- Build the runtime config.
     ok, err = self:_buildConfig()
     if not ok then return false, err end
@@ -295,7 +298,7 @@ function WireGuard:_startWireproxy()
     -- Launch wireproxy in the background.
     -- The shell writes the PID to PID_FILE and redirects all output to the log.
     local cmd = string.format(
-        "%q -c %q >%q 2>&1 & echo $! >%q",
+        "%q -c %q >>%q 2>&1 & echo $! >>%q",
         INSTALLED_BINARY,
         RUNTIME_CONF_FILE,
         WIREPROXY_LOG_FILE,
