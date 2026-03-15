@@ -25,6 +25,7 @@ local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
 local logger = require("logger")
 local ffiutil = require("ffi/util")
+local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local Device = require("device")
 local _ = require("gettext")
@@ -57,7 +58,14 @@ local WIREPROXY_LOG_FILE = CACHE_DIR .. "/" .. PLUGIN_NAME .. "_wireproxy.log"
 local PLUGIN_LOG_FILE    = CACHE_DIR .. "/" .. PLUGIN_NAME .. "_plugin.log"
 -- Installed binary lives in the exec-capable data directory.  /sdcard is
 -- mounted noexec on Android so we always copy the binary here first.
-local INSTALLED_BINARY   = DATA_DIR .. "/wireproxy"
+local DEFAULT_INSTALLED_BINARY = CACHE_DIR .. "/wireproxy"
+local EXEC_DIR_CANDIDATES = {
+    CACHE_DIR,
+    "/data/data/org.koreader.launcher/files",
+    "/data/data/org.koreader.launcher.fdroid/files",
+    "/data/data/com.github.koreader/files",
+    "/data/data/org.koreader.launcher.debug/files",
+}
 local MAX_LOG_TAIL_BYTES = 4096   -- bytes shown in the log viewer
 local STOP_WAIT_LOOPS    = 20     -- × 100 ms = 2 s graceful wait
 local KILL_WAIT_LOOPS    = 10     -- × 100 ms = 1 s after SIGKILL
@@ -80,6 +88,7 @@ function WireGuard:init()
     self.settings = LuaSettings:open(settings_path)
 
     self.wireproxy_binary = self.settings:readSetting("wireproxy_binary") or ""
+    self.installed_binary = self.settings:readSetting("installed_binary") or DEFAULT_INSTALLED_BINARY
     self.wireguard_config = self.settings:readSetting("wireguard_config") or ""
     self.socks5_port      = self.settings:readSetting("socks5_port") or DEFAULT_SOCKS5_PORT
     self.autostart        = self.settings:isTrue("autostart")
@@ -89,6 +98,7 @@ function WireGuard:init()
         "Settings — binary=%q  config=%q  port=%d  autostart=%s",
         self.wireproxy_binary, self.wireguard_config,
         self.socks5_port, tostring(self.autostart)))
+    self:_log("DEBUG", "Installed binary path: " .. tostring(self.installed_binary))
 
     -- Register to main menu
     if self.ui and self.ui.menu then
@@ -113,6 +123,7 @@ end
 
 function WireGuard:_saveSettings()
     self.settings:saveSetting("wireproxy_binary", self.wireproxy_binary)
+    self.settings:saveSetting("installed_binary", self.installed_binary)
     self.settings:saveSetting("wireguard_config",  self.wireguard_config)
     self.settings:saveSetting("socks5_port",       self.socks5_port)
     if self.autostart then
@@ -239,8 +250,11 @@ function WireGuard:_checkPrereqs()
     end
     -- Check the installed copy (in the exec-capable data directory), not the
     -- original source which may be on a noexec mount such as /sdcard.
-    if not util.pathExists(INSTALLED_BINARY) then
+    if not util.pathExists(self.installed_binary) then
         return false, _("wireproxy binary not installed.\nPlease use \"Select wireproxy binary\226\128\166\" again.")
+    end
+    if os.execute(string.format("[ -x %q ]", self.installed_binary)) ~= 0 then
+        return false, _("Installed wireproxy binary is not executable:\n") .. self.installed_binary
     end
     if not util.pathExists(self.wireguard_config) then
         return false, _("WireGuard config not found:\n") .. self.wireguard_config
@@ -286,10 +300,10 @@ function WireGuard:_startWireproxy()
     end
 
     -- Ensure the installed binary is executable (belt-and-suspenders guard).
-    os.execute(string.format("chmod +x %q 2>/dev/null", INSTALLED_BINARY))
+    os.execute(string.format("chmod +x %q 2>/dev/null", self.installed_binary))
 
     -- Show file permissions
-    os.execute(string.format("ls -ahl %q >%q", INSTALLED_BINARY, WIREPROXY_LOG_FILE))
+    os.execute(string.format("ls -ahl %q >%q", self.installed_binary, WIREPROXY_LOG_FILE))
 
     -- Build the runtime config.
     ok, err = self:_buildConfig()
@@ -299,7 +313,7 @@ function WireGuard:_startWireproxy()
     -- The shell writes the PID to PID_FILE and redirects all output to the log.
     local cmd = string.format(
         "%q -c %q >>%q 2>&1 & echo $! >>%q",
-        INSTALLED_BINARY,
+        self.installed_binary,
         RUNTIME_CONF_FILE,
         WIREPROXY_LOG_FILE,
         PID_FILE)
@@ -459,11 +473,57 @@ local function _showUnfilteredPathChooser(opts)
     UIManager:show(PathChooser:new(opts))
 end
 
+local function _copyFile(source_path, destination_path)
+    local source = io.open(source_path, "rb")
+    if not source then
+        return false, "source open failed"
+    end
+    local destination = io.open(destination_path, "wb")
+    if not destination then
+        source:close()
+        return false, "destination open failed"
+    end
+    while true do
+        local chunk = source:read(64 * 1024)
+        if not chunk then break end
+        destination:write(chunk)
+    end
+    source:close()
+    destination:close()
+    return true
+end
+
+function WireGuard:_installBinaryToExecutableDir(source_binary)
+    self:_log("DEBUG", "Installing wireproxy from source: " .. tostring(source_binary))
+    for _, target_dir in ipairs(EXEC_DIR_CANDIDATES) do
+        self:_log("DEBUG", "Trying install directory: " .. target_dir)
+        if lfs.attributes(target_dir, "mode") ~= "directory" then
+            self:_log("DEBUG", "Skipping missing directory: " .. target_dir)
+        else
+            local destination = target_dir .. "/wireproxy"
+            local copied, copy_err = _copyFile(source_binary, destination)
+            if not copied then
+                self:_log("DEBUG", string.format("Copy failed to %s: %s", destination, tostring(copy_err)))
+            else
+                local chmod_ret = os.execute(string.format("chmod +x %q 2>/dev/null", destination))
+                local permissions = lfs.attributes(destination, "permissions") or "unknown"
+                local has_exec_bit = permissions:find("x", 1, true) ~= nil
+                self:_log("DEBUG", string.format(
+                    "Install probe dir=%s chmod_ret=%s perms=%s exec_bit=%s",
+                    target_dir, tostring(chmod_ret), tostring(permissions), tostring(has_exec_bit)))
+                if has_exec_bit then
+                    self:_log("INFO", "Selected executable install path: " .. destination)
+                    return destination
+                end
+            end
+        end
+    end
+    return nil, _("No executable install directory found for wireproxy.")
+end
+
 --- Open a PathChooser to let the user select the wireproxy binary.
---- The chosen file is copied to INSTALLED_BINARY (an exec-capable location
---- inside KOReader's data directory) and made executable.  /sdcard and other
---- external storage locations are mounted noexec on Android, so the binary
---- must live in the data directory to be launchable.
+--- The chosen file is copied to the first exec-capable data directory:
+--- cache first, then known package /data/data/.../files fallbacks.
 function WireGuard:_pickBinary()
     local start_path = _getPickerStartPath(self.wireproxy_binary)
     self:_log("DEBUG", "Opening binary picker at: " .. tostring(start_path))
@@ -478,36 +538,22 @@ function WireGuard:_pickBinary()
         path           = start_path,
         onConfirm      = function(chosen_path)
             if not chosen_path or chosen_path == "" then return end
-
-            -- Copy to the exec-capable data directory.
-            local cp_ret = os.execute(
-                string.format("cp %q %q 2>/dev/null", chosen_path, INSTALLED_BINARY))
-            if cp_ret ~= 0 then
-                self:_log("ERROR", "Failed to copy binary: " .. chosen_path)
-                _info(string.format(
-                    _("Failed to copy binary.\n\nSource:\n%s\n\nDestination:\n%s"),
-                    chosen_path, INSTALLED_BINARY), true)
-                return
-            end
-
-            -- Make the installed copy executable.
-            local chmod_ret = os.execute(
-                string.format("chmod +x %q 2>/dev/null", INSTALLED_BINARY))
-            if chmod_ret ~= 0 then
-                self:_log("ERROR", "chmod +x failed on: " .. INSTALLED_BINARY)
-                _info(string.format(
-                    _("Binary copied but chmod +x failed.\nDestination:\n%s"),
-                    INSTALLED_BINARY), true)
+            local installed_path, err = self:_installBinaryToExecutableDir(chosen_path)
+            if not installed_path then
+                self:_log("ERROR", "wireproxy install failed: " .. tostring(err))
+                _info(_("Failed to install executable wireproxy binary.\n\n") .. (err or _("Unknown error")), true)
                 return
             end
 
             -- Remember the source path so the picker re-opens in the same dir.
             self.wireproxy_binary = chosen_path
+            self.installed_binary = installed_path
             self:_saveSettings()
-            self:_log("INFO", "wireproxy binary installed to: " .. INSTALLED_BINARY)
+            self:_log("INFO", "wireproxy source binary set to: " .. chosen_path)
+            self:_log("INFO", "wireproxy installed binary set to: " .. installed_path)
             _info(string.format(
-                _("wireproxy binary installed to:\n%s\n\nRepeat this step to update the binary."),
-                INSTALLED_BINARY), false, 4)
+                _("wireproxy binary installed to:\n%s"),
+                installed_path), false, 4)
         end,
     }
 end
@@ -587,7 +633,7 @@ function WireGuard:_showStatus()
             string.format(_("SOCKS5 port:  %d"), self.socks5_port),
             string.format(_("Autostart:    %s"), self.autostart and _("Yes") or _("No")),
             "",
-            string.format(_("Installed binary:\n  %s"), util.pathExists(INSTALLED_BINARY) and INSTALLED_BINARY or _("(not installed)")),
+            string.format(_("Installed binary:\n  %s"), util.pathExists(self.installed_binary) and self.installed_binary or _("(not installed)")),
             string.format(_("Source binary:\n  %s"), self.wireproxy_binary  ~= "" and self.wireproxy_binary  or _("(not set)")),
             string.format(_("Config:\n  %s"), self.wireguard_config  ~= "" and self.wireguard_config  or _("(not set)")),
             string.format(_("Runtime conf:\n  %s"), RUNTIME_CONF_FILE),
