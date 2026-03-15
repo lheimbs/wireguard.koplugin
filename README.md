@@ -11,8 +11,8 @@ Supports **Android 4.4 and later** as well as other Linux-based KOReader platfor
 ## Features
 
 - **Enable/Disable toggle** — Start or stop the VPN from the KOReader main menu.
-- **File pickers** — Use KOReader's built-in path chooser to select both the
-  `wireproxy` binary and your WireGuard `.conf` file.
+- **File pickers** — Use KOReader's built-in path chooser to select your
+  WireGuard `.conf` file and an optional `wireproxy` fallback binary.
 - **Automatic config patching** — The plugin writes a temporary copy of your
   WireGuard config and appends a `[Socks5]` section automatically.
 - **Proxy environment setup** — Sets `http_proxy`, `https_proxy` and `ALL_PROXY`
@@ -39,7 +39,7 @@ The plugin will appear as **WireGuard VPN** under *More tools* in the main menu.
 
 ## Setup
 
-### 1 — Obtain a wireproxy binary
+### 1 — Obtain a wireproxy binary (fallback on Android)
 
 Download (or cross-compile) a `wireproxy` binary for your device's CPU
 architecture from the [wireproxy releases page](https://github.com/whyvl/wireproxy/releases):
@@ -51,6 +51,10 @@ architecture from the [wireproxy releases page](https://github.com/whyvl/wirepro
 | Kobo / Kindle (ARM) | `arm` |
 
 Copy the binary to your device (e.g. `/sdcard/wireproxy`).
+
+On Android builds that bundle `libwireproxy.so`, KOReader will use the bundled
+library from `android.nativeLibraryDir` by default. The selected binary is kept
+as a fallback path.
 
 ### 2 — Prepare a WireGuard config
 
@@ -143,7 +147,7 @@ Log files are stored in KOReader's cache directory:
 ## Requirements
 
 - KOReader with LuaJIT (standard KOReader builds include this).
-- A `wireproxy` binary compiled for your device architecture.
+- A `wireproxy` binary compiled for your device architecture (required on non-Android; optional fallback on Android when `libwireproxy.so` is bundled).
 - A valid WireGuard `.conf` file.
 - `nc` (netcat) available on the device — used only for the SOCKS5 port test;
   present by default on Android via BusyBox.

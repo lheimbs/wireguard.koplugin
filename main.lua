@@ -1,17 +1,17 @@
 --[[
 WireGuard VPN Plugin for KOReader
 Routes all network traffic through a WireGuard VPN tunnel using wireproxy
-as a local SOCKS5 proxy. Supports Android 4.4+.
+as a local HTTP CONNECT proxy. Supports Android 4.4+.
 
 Usage:
   1. Select your wireproxy binary via the menu.
   2. Select your WireGuard .conf file via the menu.
   3. Toggle "Enable WireGuard VPN" to start the tunnel.
 
-The plugin will append a [Socks5] section to the WireGuard config (writing
+The plugin will append an [http] section to the WireGuard config (writing
 a modified copy to a temp path) and launch wireproxy as a background process.
-It then sets http_proxy/https_proxy/ALL_PROXY environment variables so that
-KOReader's network stack routes through the SOCKS5 tunnel.
+It then configures KOReader's HTTP proxy (via NetworkMgr) so that LuaSocket
+and all HTTP traffic routes through the tunnel.
 --]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -28,7 +28,9 @@ local ffiutil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local Device = require("device")
+local NetworkMgr = require("ui/network/manager")
 local _ = require("gettext")
+local hasAndroid, android = pcall(require, "android")
 
 -- ---------------------------------------------------------------------------
 -- Module-level FFI setup for setenv/unsetenv (Linux/Android)
@@ -47,7 +49,7 @@ end)
 -- Constants
 -- ---------------------------------------------------------------------------
 local PLUGIN_NAME        = "wireguard"
-local DEFAULT_SOCKS5_PORT = 1080
+local DEFAULT_PROXY_PORT  = 1080
 
 -- DataStorage does not expose getCacheDir(); cache lives under data dir.
 local DATA_DIR           = DataStorage:getDataDir()
@@ -66,6 +68,7 @@ local EXEC_DIR_CANDIDATES = {
     "/data/data/com.github.koreader/files",
     "/data/data/org.koreader.launcher.debug/files",
 }
+local BUNDLED_WIREPROXY_LIB = "libwireproxy.so"
 local MAX_LOG_TAIL_BYTES = 4096   -- bytes shown in the log viewer
 local STOP_WAIT_LOOPS    = 20     -- × 100 ms = 2 s graceful wait
 local KILL_WAIT_LOOPS    = 10     -- × 100 ms = 1 s after SIGKILL
@@ -90,15 +93,20 @@ function WireGuard:init()
     self.wireproxy_binary = self.settings:readSetting("wireproxy_binary") or ""
     self.installed_binary = self.settings:readSetting("installed_binary") or DEFAULT_INSTALLED_BINARY
     self.wireguard_config = self.settings:readSetting("wireguard_config") or ""
-    self.socks5_port      = self.settings:readSetting("socks5_port") or DEFAULT_SOCKS5_PORT
+    self.proxy_port       = self.settings:readSetting("proxy_port") or DEFAULT_PROXY_PORT
     self.autostart        = self.settings:isTrue("autostart")
 
     self:_log("INFO", "Plugin initialized")
     self:_log("DEBUG", string.format(
         "Settings — binary=%q  config=%q  port=%d  autostart=%s",
         self.wireproxy_binary, self.wireguard_config,
-        self.socks5_port, tostring(self.autostart)))
+        self.proxy_port, tostring(self.autostart)))
     self:_log("DEBUG", "Installed binary path: " .. tostring(self.installed_binary))
+    if hasAndroid and android and android.nativeLibraryDir then
+        self:_log("DEBUG", "Android nativeLibraryDir: " .. android.nativeLibraryDir)
+        local bundled_path = self:_getBundledWireproxyPath()
+        self:_log("DEBUG", "Bundled wireproxy " .. (bundled_path and ("found at " .. bundled_path) or "not found"))
+    end
 
     -- Register to main menu
     if self.ui and self.ui.menu then
@@ -125,7 +133,7 @@ function WireGuard:_saveSettings()
     self.settings:saveSetting("wireproxy_binary", self.wireproxy_binary)
     self.settings:saveSetting("installed_binary", self.installed_binary)
     self.settings:saveSetting("wireguard_config",  self.wireguard_config)
-    self.settings:saveSetting("socks5_port",       self.socks5_port)
+    self.settings:saveSetting("proxy_port",        self.proxy_port)
     if self.autostart then
         self.settings:makeTrue("autostart")
     else
@@ -188,21 +196,123 @@ end
 function WireGuard:_readPID()
     local f = io.open(PID_FILE, "r")
     if not f then return nil end
-    local s = f:read("*l")
+    local content = f:read("*a")
     f:close()
-    return s and tonumber(s) or nil
+    if not content or content == "" then return nil end
+    local pid
+    for line in content:gmatch("[^\r\n]+") do
+        local n = tonumber(line)
+        if n then pid = n end
+    end
+    return pid
 end
+
+local _pidExists
 
 --- Return true when the wireproxy process is alive.
 function WireGuard:_isRunning()
     local pid = self:_readPID()
     if not pid then return false end
-    return util.pathExists("/proc/" .. tostring(pid))
+    return _pidExists(pid)
 end
 
 --- Send a signal to a process.  Returns true on success.
 local function _sendSignal(sig, pid)
-    return os.execute(string.format("kill -%s %d 2>/dev/null", sig, pid)) == 0
+    local sig_num = ({ TERM = 15, KILL = 9 })[sig]
+    if not sig_num then
+        return false
+    end
+    return ffi.C.kill(pid, sig_num) == 0
+end
+
+local function _pidStatus(pid)
+    if not pid then return false, nil end
+    if ffi.C.kill(pid, 0) == 0 then
+        return true, 0
+    end
+    local err = ffi.errno()
+    -- EPERM means the process exists but we are not allowed to signal it.
+    if err == ffi.C.EPERM then
+        return true, err
+    end
+    return false, err
+end
+
+function _pidExists(pid)
+    local alive = _pidStatus(pid)
+    return alive
+end
+
+local function _readCommandOutput(cmd)
+    local f = io.popen(cmd)
+    if not f then return "" end
+    local out = f:read("*a") or ""
+    f:close()
+    return out:gsub("%s+$", "")
+end
+
+local function _basename(path)
+    return path and path:match("([^/]+)$") or nil
+end
+
+local function _runShellWithOutput(cmd)
+    local tmp = CACHE_DIR .. "/" .. PLUGIN_NAME .. "_diag.tmp"
+    os.remove(tmp)
+    local rc = os.execute(string.format("%s >%q 2>&1", cmd, tmp))
+    local out = _readLogTail(tmp) or ""
+    os.remove(tmp)
+    return rc, out
+end
+
+local function _commandExists(name)
+    return os.execute(string.format("command -v %q >/dev/null 2>&1", name)) == 0
+end
+
+function WireGuard:_findWireproxyPid(binary_path)
+    local name = _basename(binary_path) or "wireproxy"
+    local out = _readCommandOutput(string.format("pidof %q 2>/dev/null", name))
+    local pid
+    for token in out:gmatch("%d+") do
+        pid = tonumber(token)
+    end
+    return pid
+end
+
+function WireGuard:_isProxyPortReachable()
+    if not _commandExists("nc") then
+        self:_log("DEBUG", "nc not available; skipping proxy port probe")
+        return false
+    end
+    return os.execute(string.format("nc -z -w 1 127.0.0.1 %d >/dev/null 2>&1", self.proxy_port)) == 0
+end
+
+function WireGuard:_logStartupDiagnostics(binary_path, pid)
+    local name = _basename(binary_path) or "wireproxy"
+    self:_log("DEBUG", "--- wireproxy startup diagnostics begin ---")
+    local checks = {
+        { "which-nohup", "command -v nohup || true" },
+        { "which-sh", "command -v sh || true" },
+        { "which-nc", "command -v nc || true" },
+        { "binary-ls", string.format("ls -ahl %q || true", binary_path) },
+        { "config-ls", string.format("ls -ahl %q || true", RUNTIME_CONF_FILE) },
+        { "pidfile-ls", string.format("ls -ahl %q || true", PID_FILE) },
+        { "pidfile-cat", string.format("cat %q || true", PID_FILE) },
+        { "ps-wireproxy", "ps -A 2>/dev/null | grep -i wireproxy || true" },
+        { "pidof", string.format("pidof %q 2>/dev/null || true", name) },
+        { "configtest", string.format("%q -n -c %q || true", binary_path, RUNTIME_CONF_FILE) },
+        { "log-head", string.format("head -n 40 %q || true", WIREPROXY_LOG_FILE) },
+    }
+    if pid then
+        table.insert(checks, { "ps-pid", string.format("ps -A 2>/dev/null | grep -E '^[[:space:]]*%d[[:space:]]' || true", pid) })
+    end
+    for _, check in ipairs(checks) do
+        local rc, out = _runShellWithOutput(check[2])
+        self:_log("DEBUG", string.format("diag[%s] rc=%s", check[1], tostring(rc)))
+        if out ~= "" then
+            self:_log("DEBUG", string.format("diag[%s] output:\n%s", check[1], out))
+        end
+    end
+    self:_log("DEBUG", "--- wireproxy startup diagnostics end ---")
 end
 
 --- Build the modified wireproxy config and write it to RUNTIME_CONF_FILE.
@@ -216,18 +326,18 @@ function WireGuard:_buildConfig()
     local cfg = f:read("*a")
     f:close()
 
-    -- If a [Socks5] section is already present, update its BindAddress.
+    -- If an [http] section is already present, update its BindAddress.
     -- Otherwise append a new section.
-    if cfg:match("%[Socks5%]") then
+    if cfg:match("%[http%]") then
         cfg = cfg:gsub(
             "(BindAddress%s*=%s*)[^\n]*",
-            string.format("%%1127.0.0.1:%d", self.socks5_port),
+            string.format("%%1127.0.0.1:%d", self.proxy_port),
             1)
-        self:_log("DEBUG", "Updated existing [Socks5] BindAddress")
+        self:_log("DEBUG", "Updated existing [http] BindAddress")
     else
-        cfg = cfg .. string.format("\n[Socks5]\nBindAddress = 127.0.0.1:%d\n",
-                                   self.socks5_port)
-        self:_log("DEBUG", "Appended [Socks5] section with port " .. self.socks5_port)
+        cfg = cfg .. string.format("\n[http]\nBindAddress = 127.0.0.1:%d\n",
+                                   self.proxy_port)
+        self:_log("DEBUG", "Appended [http] section with port " .. self.proxy_port)
     end
 
     local out = io.open(RUNTIME_CONF_FILE, "w")
@@ -240,21 +350,44 @@ function WireGuard:_buildConfig()
     return true
 end
 
+function WireGuard:_getBundledWireproxyPath()
+    if hasAndroid and android and android.nativeLibraryDir then
+        local bundled_path = android.nativeLibraryDir .. "/" .. BUNDLED_WIREPROXY_LIB
+        if util.pathExists(bundled_path) then
+            return bundled_path
+        end
+    end
+    return nil
+end
+
+function WireGuard:_resolveWireproxyBinary()
+    local bundled_path = self:_getBundledWireproxyPath()
+    if bundled_path then
+        return bundled_path, true
+    end
+    return self.installed_binary, false
+end
+
 --- Validate prerequisites.  Returns true or false + message.
 function WireGuard:_checkPrereqs()
-    if self.wireproxy_binary == "" then
+    local binary_path, is_bundled = self:_resolveWireproxyBinary()
+    if not is_bundled and self.wireproxy_binary == "" then
         return false, _("wireproxy binary is not configured.\nPlease select it from the WireGuard menu.")
     end
     if self.wireguard_config == "" then
         return false, _("WireGuard config file is not configured.\nPlease select it from the WireGuard menu.")
     end
-    -- Check the installed copy (in the exec-capable data directory), not the
-    -- original source which may be on a noexec mount such as /sdcard.
-    if not util.pathExists(self.installed_binary) then
-        return false, _("wireproxy binary not installed.\nPlease use \"Select wireproxy binary\226\128\166\" again.")
+    if not util.pathExists(binary_path) then
+        if is_bundled then
+            return false, _("Bundled wireproxy library not found:\n") .. binary_path
+        end
+        return false, _("wireproxy binary not installed.\nPlease use \"Select wireproxy binary…\" again.")
     end
-    if os.execute(string.format("[ -x %q ]", self.installed_binary)) ~= 0 then
-        return false, _("Installed wireproxy binary is not executable:\n") .. self.installed_binary
+    if os.execute(string.format("[ -x %q ]", binary_path)) ~= 0 then
+        if is_bundled then
+            return false, _("Bundled wireproxy is not executable:\n") .. binary_path
+        end
+        return false, _("Installed wireproxy binary is not executable:\n") .. binary_path
     end
     if not util.pathExists(self.wireguard_config) then
         return false, _("WireGuard config not found:\n") .. self.wireguard_config
@@ -262,30 +395,198 @@ function WireGuard:_checkPrereqs()
     return true
 end
 
---- Set or clear proxy-related environment variables so KOReader's network
---- stack routes through the local SOCKS5 tunnel.
+--- Configure KOReader's HTTP proxy to route traffic through the local tunnel.
+--- Uses NetworkMgr so LuaSocket's http.PROXY is set correctly.
 function WireGuard:_applyProxyEnv(enable)
-    local proxy_url = string.format("socks5h://127.0.0.1:%d", self.socks5_port)
-    local vars = {
-        "ALL_PROXY", "all_proxy",
-        "http_proxy", "HTTP_PROXY",
-        "https_proxy", "HTTPS_PROXY",
-    }
+    local proxy_url = string.format("http://127.0.0.1:%d", self.proxy_port)
     if enable then
-        self:_log("INFO", "Setting proxy env vars → " .. proxy_url)
-        for _, name in ipairs(vars) do
-            pcall(ffi.C.setenv, name, proxy_url, 1)
-        end
-        -- Also store in KOReader global settings for any plugin that reads it.
-        G_reader_settings:saveSetting("http_proxy",  proxy_url)
-        G_reader_settings:saveSetting("https_proxy", proxy_url)
+        self:_log("INFO", "Setting HTTP proxy → " .. proxy_url)
+        NetworkMgr:setHTTPProxy(proxy_url)
+        self:_patchHttpForProxy()
     else
-        self:_log("INFO", "Clearing proxy env vars")
-        for _, name in ipairs(vars) do
-            pcall(ffi.C.unsetenv, name)
-        end
+        self:_log("INFO", "Clearing HTTP proxy")
+        self:_unpatchHttpForProxy()
+        NetworkMgr:setHTTPProxy(nil)
         G_reader_settings:delSetting("http_proxy")
-        G_reader_settings:delSetting("https_proxy")
+        G_reader_settings:delSetting("http_proxy_enabled")
+    end
+end
+
+--- Monkey-patch socket.http.request to support HTTPS via HTTP CONNECT proxy.
+---
+--- LuaSocket's http module only does forward-proxy requests (sending the full
+--- URL to the proxy), which works for plain http:// targets but not https://.
+--- For https:// we must send HTTP CONNECT to the proxy, establish the TLS
+--- tunnel ourselves, then send the normal relative-path request through it.
+function WireGuard:_patchHttpForProxy()
+    local ok, http = pcall(require, "socket.http")
+    if not ok then return end
+    if http._wireguard_patched then return end
+
+    local ok_ssl, ssl = pcall(require, "ssl")
+    if not ok_ssl then
+        self:_log("WARN", "ssl module not available; HTTPS through proxy will timeout")
+        return
+    end
+
+    local socket_lib = require("socket")
+    local url_mod    = require("socket.url")
+    local ltn12      = require("ltn12")
+    local orig       = http.request
+
+    http._wireguard_original_request = orig
+    http._wireguard_patched          = true
+
+    local log = function(level, msg) self:_log(level, "http-patch: " .. msg) end
+
+    http.request = socket_lib.protect(function(reqt, body)
+        local target_url = type(reqt) == "string" and reqt
+                           or (type(reqt) == "table" and reqt.url) or ""
+
+        -- Only intercept HTTPS requests when proxy is active and no custom create
+        if not http.PROXY
+            or not target_url:match("^https://")
+            or (type(reqt) == "table" and reqt.create)
+        then
+            return orig(reqt, body)
+        end
+
+        local parsed   = url_mod.parse(target_url)
+        local tgt_host = parsed.host
+        local tgt_port = tonumber(parsed.port) or 443
+
+        -- Build a path-only URI (servers behind a CONNECT tunnel expect this)
+        local path_uri = parsed.path or "/"
+        if parsed.params then path_uri = path_uri .. ";" .. parsed.params end
+        if parsed.query  then path_uri = path_uri .. "?" .. parsed.query  end
+
+        -- Factory: returns a fresh socket wrapper each time create() is called.
+        -- The wrapper's connect() establishes the CONNECT tunnel then TLS.
+        local function make_connect_socket()
+            local raw = socket_lib.tcp()
+            local tls = nil
+
+            local w = setmetatable({}, {
+                __index = function(_, k)
+                    local d = tls or raw
+                    local v = d[k]
+                    if type(v) == "function" then
+                        return function(_, ...) return v(d, ...) end
+                    end
+                    return v
+                end,
+            })
+
+            function w:settimeout(t)
+                raw:settimeout(t)
+                if tls then tls:settimeout(t) end
+                return 1
+            end
+
+            function w:connect(proxy_h, proxy_p)
+                -- 1. TCP to proxy
+                local c_ok, c_err = raw:connect(proxy_h, proxy_p)
+                if not c_ok then
+                    log("ERROR", string.format("TCP→proxy %s:%s failed: %s",
+                        proxy_h, proxy_p, tostring(c_err)))
+                    return nil, c_err
+                end
+                log("DEBUG", string.format("TCP→proxy OK; sending CONNECT %s:%d",
+                    tgt_host, tgt_port))
+
+                -- 2. HTTP CONNECT request
+                raw:send(string.format(
+                    "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n",
+                    tgt_host, tgt_port, tgt_host, tgt_port))
+
+                -- 3. Read status line
+                local line, l_err = raw:receive("*l")
+                if not line then
+                    log("ERROR", "no response from proxy: " .. tostring(l_err))
+                    return nil, l_err or "proxy no response"
+                end
+                local code = tonumber(line:match("HTTP/%S+ (%d+)"))
+                if code ~= 200 then
+                    log("ERROR", "CONNECT rejected: " .. tostring(line))
+                    return nil, "HTTP CONNECT failed: " .. tostring(line)
+                end
+                -- Drain remaining proxy headers
+                repeat
+                    line, l_err = raw:receive("*l")
+                    if not line then return nil, l_err or "proxy header error" end
+                until line == ""
+
+                log("DEBUG", "CONNECT tunnel established; starting TLS handshake")
+
+                -- 4. TLS over the tunnel
+                local ts, ts_err = ssl.wrap(raw, {
+                    mode       = "client",
+                    protocol   = "any",
+                    verify     = "none",
+                    options    = {"all"},
+                    servername = tgt_host,  -- SNI
+                })
+                if not ts then
+                    log("ERROR", "ssl.wrap failed: " .. tostring(ts_err))
+                    return nil, ts_err or "ssl.wrap failed"
+                end
+                -- Set SNI via method call as well (LuaSec API variant)
+                if ts.sni then ts:sni(tgt_host) end
+                local hs_ok, hs_err = ts:dohandshake()
+                if not hs_ok then
+                    log("ERROR", "TLS handshake failed: " .. tostring(hs_err))
+                    return nil, hs_err or "TLS handshake failed"
+                end
+                tls = ts
+                log("DEBUG", string.format("TLS to %s:%d OK", tgt_host, tgt_port))
+                return 1
+            end
+
+            return w
+        end
+
+        -- Build request table with our create + explicit path URI
+        local new_req
+        if type(reqt) == "string" then
+            local t = {}
+            new_req = {
+                url    = reqt,
+                sink   = ltn12.sink.table(t),
+                target = t,
+                uri    = path_uri,
+                create = make_connect_socket,
+            }
+            if body then
+                new_req.source  = ltn12.source.string(body)
+                new_req.headers = {
+                    ["content-length"] = #body,
+                    ["content-type"]   = "application/x-www-form-urlencoded",
+                }
+                new_req.method = "POST"
+            end
+            local _, code, headers, status = orig(new_req)
+            return table.concat(t), code, headers, status
+        else
+            new_req = {}
+            for k, v in pairs(reqt) do new_req[k] = v end
+            new_req.create = make_connect_socket
+            new_req.uri    = path_uri
+            return orig(new_req)
+        end
+    end)
+
+    self:_log("INFO", "socket.http patched: HTTPS tunnelled via HTTP CONNECT")
+end
+
+--- Restore the original socket.http.request.
+function WireGuard:_unpatchHttpForProxy()
+    local ok, http = pcall(require, "socket.http")
+    if not ok then return end
+    if http._wireguard_original_request then
+        http.request = http._wireguard_original_request
+        http._wireguard_original_request = nil
+        http._wireguard_patched          = nil
+        self:_log("INFO", "socket.http.request restored")
     end
 end
 
@@ -293,17 +594,22 @@ end
 function WireGuard:_startWireproxy()
     local ok, err = self:_checkPrereqs()
     if not ok then return false, err end
+    local binary_path, is_bundled = self:_resolveWireproxyBinary()
 
     if self:_isRunning() then
         self:_log("WARN", "wireproxy is already running — skipping start")
         return true
     end
 
-    -- Ensure the installed binary is executable (belt-and-suspenders guard).
-    os.execute(string.format("chmod +x %q 2>/dev/null", self.installed_binary))
+    if is_bundled then
+        self:_log("INFO", "Using bundled wireproxy: " .. binary_path)
+    else
+        -- Ensure the installed binary is executable (belt-and-suspenders guard).
+        os.execute(string.format("chmod +x %q 2>/dev/null", binary_path))
+    end
 
     -- Show file permissions
-    os.execute(string.format("ls -ahl %q >%q", self.installed_binary, WIREPROXY_LOG_FILE))
+    os.execute(string.format("ls -ahl %q >%q", binary_path, WIREPROXY_LOG_FILE))
 
     -- Build the runtime config.
     ok, err = self:_buildConfig()
@@ -311,31 +617,86 @@ function WireGuard:_startWireproxy()
 
     -- Launch wireproxy in the background.
     -- The shell writes the PID to PID_FILE and redirects all output to the log.
-    local cmd = string.format(
-        "%q -c %q >>%q 2>&1 & echo $! >>%q",
-        self.installed_binary,
-        RUNTIME_CONF_FILE,
-        WIREPROXY_LOG_FILE,
-        PID_FILE)
+    local cmd
+    local has_custom_ld_library_path = false
+    if is_bundled and hasAndroid and android and android.nativeLibraryDir then
+        self:_log("DEBUG", "Setting LD_LIBRARY_PATH to " .. android.nativeLibraryDir)
+        pcall(ffi.C.setenv, "LD_LIBRARY_PATH", android.nativeLibraryDir, 1)
+        has_custom_ld_library_path = true
+        cmd = string.format(
+            "nohup %q -c %q >%q 2>&1 </dev/null & echo $! >%q",
+            binary_path,
+            RUNTIME_CONF_FILE,
+            WIREPROXY_LOG_FILE,
+            PID_FILE)
+    else
+        cmd = string.format(
+            "nohup %q -c %q >%q 2>&1 </dev/null & echo $! >%q",
+            binary_path,
+            RUNTIME_CONF_FILE,
+            WIREPROXY_LOG_FILE,
+            PID_FILE)
+    end
     self:_log("DEBUG", "Launching wireproxy: " .. cmd)
 
     local ret = os.execute(cmd)
+    if has_custom_ld_library_path then
+        pcall(ffi.C.unsetenv, "LD_LIBRARY_PATH")
+    end
     if ret ~= 0 then
+        self:_logStartupDiagnostics(binary_path, nil)
         return false, _("os.execute failed while starting wireproxy (exit code ") .. tostring(ret) .. ")"
     end
 
     -- Give the process a moment to initialise.
     ffiutil.sleep(1)
+    local pid = self:_readPID()
+    self:_log("DEBUG", "PID file after launch: " .. tostring(pid))
 
-    if not self:_isRunning() then
+    local running = false
+    for _ = 1, 20 do
+        if self:_isRunning() then
+            running = true
+            break
+        end
+        ffiutil.sleep(0.1)
+    end
+
+    if not running then
+        local recovered_pid = self:_findWireproxyPid(binary_path)
+        if recovered_pid and _pidExists(recovered_pid) then
+            local f = io.open(PID_FILE, "w")
+            if f then
+                f:write(tostring(recovered_pid), "\n")
+                f:close()
+            end
+            pid = recovered_pid
+            running = true
+            self:_log("INFO", "Recovered running wireproxy PID via pidof: " .. tostring(recovered_pid))
+        end
+    end
+
+    if not running and self:_isProxyPortReachable() then
+        running = true
+        self:_log("INFO", "HTTP proxy port became reachable even though PID checks failed")
+    end
+
+    if not running then
+        self:_logStartupDiagnostics(binary_path, pid)
         local log_tail = _readLogTail(WIREPROXY_LOG_FILE) or ""
+        if pid then
+            local _, err = _pidStatus(pid)
+            self:_log("DEBUG", "PID liveness check failed for PID " .. tostring(pid) ..
+                " errno=" .. tostring(err))
+        end
+        self:_log("DEBUG", "pidof output: " ..
+            _readCommandOutput(string.format("pidof %q 2>/dev/null", _basename(binary_path) or "wireproxy")))
         self:_log("ERROR", "wireproxy failed to start. Log tail:\n" .. log_tail)
         return false,
             _("wireproxy process died immediately after launch.\n\n") ..
             _("Last log output:\n") .. log_tail
     end
 
-    local pid = self:_readPID()
     self:_log("INFO", string.format("wireproxy running (PID %s)", tostring(pid)))
 
     -- Route KOReader traffic through the tunnel.
@@ -350,13 +711,16 @@ function WireGuard:_stopWireproxy()
 
     local pid = self:_readPID()
     if not pid then
-        -- Try a name-based kill as a fallback (best-effort).
-        os.execute("pkill -f wireproxy 2>/dev/null; true")
-        self:_log("INFO", "No PID file found; attempted name-based stop")
-        return true
+        local binary_path = self:_resolveWireproxyBinary()
+        pid = self:_findWireproxyPid(binary_path)
+        if not pid then
+            self:_log("INFO", "No PID file found and no running wireproxy process detected")
+            return true
+        end
+        self:_log("INFO", "Recovered PID from pidof for stop: " .. tostring(pid))
     end
 
-    if not util.pathExists("/proc/" .. tostring(pid)) then
+    if not _pidExists(pid) then
         os.remove(PID_FILE)
         self:_log("INFO", "wireproxy was already stopped")
         return true
@@ -365,21 +729,21 @@ function WireGuard:_stopWireproxy()
     -- Graceful SIGTERM
     _sendSignal("TERM", pid)
     for _ = 1, STOP_WAIT_LOOPS do
-        if not util.pathExists("/proc/" .. tostring(pid)) then break end
+        if not _pidExists(pid) then break end
         ffiutil.sleep(0.1)
     end
 
     -- Force SIGKILL if still alive
-    if util.pathExists("/proc/" .. tostring(pid)) then
+    if _pidExists(pid) then
         self:_log("WARN", "wireproxy did not stop gracefully — sending SIGKILL")
         _sendSignal("KILL", pid)
         for _ = 1, KILL_WAIT_LOOPS do
-            if not util.pathExists("/proc/" .. tostring(pid)) then break end
+            if not _pidExists(pid) then break end
             ffiutil.sleep(0.1)
         end
     end
 
-    local stopped = not util.pathExists("/proc/" .. tostring(pid))
+    local stopped = not _pidExists(pid)
     if stopped then
         os.remove(PID_FILE)
         self:_log("INFO", "wireproxy stopped successfully")
@@ -527,6 +891,9 @@ end
 function WireGuard:_pickBinary()
     local start_path = _getPickerStartPath(self.wireproxy_binary)
     self:_log("DEBUG", "Opening binary picker at: " .. tostring(start_path))
+    if self:_getBundledWireproxyPath() then
+        _info(_("Bundled wireproxy is available on Android.\nSelecting a binary sets only a fallback path."), false, 4)
+    end
 
     _showUnfilteredPathChooser{
         title          = _("Select wireproxy binary"),
@@ -582,13 +949,13 @@ function WireGuard:_pickConfig()
     }
 end
 
---- Show an InputDialog so the user can change the SOCKS5 proxy port.
+--- Show an InputDialog so the user can change the HTTP proxy port.
 function WireGuard:_editPort()
     local dialog
     dialog = InputDialog:new{
-        title       = _("SOCKS5 Proxy Port"),
+        title       = _("HTTP Proxy Port"),
         description = _("Port wireproxy will listen on (default: 1080)."),
-        input       = tostring(self.socks5_port),
+        input       = tostring(self.proxy_port),
         input_type  = "number",
         buttons     = {
             {
@@ -602,10 +969,10 @@ function WireGuard:_editPort()
                     callback         = function()
                         local v = tonumber(dialog:getInputText())
                         if v and v >= 1 and v <= 65535 then
-                            self.socks5_port = v
+                            self.proxy_port = v
                             self:_saveSettings()
-                            self:_log("INFO", "SOCKS5 port changed to " .. v)
-                            _info(string.format(_("SOCKS5 port set to %d."), v), false, 2)
+                            self:_log("INFO", "HTTP proxy port changed to " .. v)
+                            _info(string.format(_("HTTP proxy port set to %d."), v), false, 2)
                         else
                             _info(_("Invalid port — must be 1–65535."), true, 3)
                         end
@@ -626,14 +993,18 @@ end
 function WireGuard:_showStatus()
     local pid     = self:_readPID()
     local running = self:_isRunning()
+    local active_binary = self:_resolveWireproxyBinary()
+    local bundled_binary = self:_getBundledWireproxyPath()
     UIManager:show(InfoMessage:new{
         text = table.concat({
             string.format(_("Status:       %s"), running and _("Running ✓") or _("Stopped")),
             string.format(_("PID:          %s"), pid and tostring(pid) or _("N/A")),
-            string.format(_("SOCKS5 port:  %d"), self.socks5_port),
+            string.format(_("HTTP proxy port: %d"), self.proxy_port),
             string.format(_("Autostart:    %s"), self.autostart and _("Yes") or _("No")),
             "",
             string.format(_("Installed binary:\n  %s"), util.pathExists(self.installed_binary) and self.installed_binary or _("(not installed)")),
+            string.format(_("Bundled binary:\n  %s"), bundled_binary or _("(not found)")),
+            string.format(_("Active binary:\n  %s"), active_binary or _("(unknown)")),
             string.format(_("Source binary:\n  %s"), self.wireproxy_binary  ~= "" and self.wireproxy_binary  or _("(not set)")),
             string.format(_("Config:\n  %s"), self.wireguard_config  ~= "" and self.wireguard_config  or _("(not set)")),
             string.format(_("Runtime conf:\n  %s"), RUNTIME_CONF_FILE),
@@ -672,7 +1043,7 @@ function WireGuard:_showActiveConfig()
     UIManager:show(InfoMessage:new{ text = redacted })
 end
 
-function WireGuard:_testSOCKS5()
+function WireGuard:_testHTTPProxy()
     if not self:_isRunning() then
         _info(_("WireGuard VPN is not running."), true)
         return
@@ -680,20 +1051,20 @@ function WireGuard:_testSOCKS5()
     -- Use nc (netcat) — available on Android 4.4+ via busybox
     local cmd = string.format(
         "nc -z -w 2 127.0.0.1 %d 2>/dev/null; echo $?",
-        self.socks5_port)
+        self.proxy_port)
     local f = io.popen(cmd)
     local out = f and f:read("*a") or ""
     if f then f:close() end
 
     local exit = out:match("(%d+)%s*$")
-    self:_log("DEBUG", string.format("SOCKS5 port-check exit=%s", tostring(exit)))
+    self:_log("DEBUG", string.format("HTTP proxy port-check exit=%s", tostring(exit)))
 
     if exit == "0" then
-        _info(string.format(_("SOCKS5 proxy is reachable on port %d. ✓"), self.socks5_port), false, 3)
+        _info(string.format(_("HTTP proxy is reachable on port %d. ✓"), self.proxy_port), false, 3)
     else
         _info(string.format(
-            _("SOCKS5 proxy is NOT reachable on port %d.\n\nwireproxy may still be starting up or the config has an error — check the wireproxy log."),
-            self.socks5_port), true)
+            _("HTTP proxy is NOT reachable on port %d.\n\nwireproxy may still be starting up or the config has an error — check the wireproxy log."),
+            self.proxy_port), true)
     end
 end
 
@@ -743,10 +1114,10 @@ function WireGuard:_troubleshootingMenu()
         },
         {
             text_func        = function()
-                return string.format(_("Test SOCKS5 Port %d"), self.socks5_port)
+                return string.format(_("Test HTTP Proxy Port %d"), self.proxy_port)
             end,
             keep_menu_open   = true,
-            callback         = function() self:_testSOCKS5() end,
+            callback         = function() self:_testHTTPProxy() end,
         },
         {
             text             = _("Show wireproxy Log"),
@@ -800,7 +1171,11 @@ function WireGuard:addToMainMenu(menu_items)
                 },
                 -- ── Configuration ────────────────────────────────────────
                 {
-                    text             = _("Select wireproxy binary…"),
+                    text_func        = function()
+                        return self:_getBundledWireproxyPath()
+                            and _("Select wireproxy binary fallback…")
+                            or _("Select wireproxy binary…")
+                    end,
                     keep_menu_open   = true,
                     callback         = function() self:_pickBinary() end,
                 },
@@ -811,7 +1186,7 @@ function WireGuard:addToMainMenu(menu_items)
                 },
                 {
                     text_func        = function()
-                        return string.format(_("SOCKS5 Port: %d"), self.socks5_port)
+                        return string.format(_("HTTP Proxy Port: %d"), self.proxy_port)
                     end,
                     keep_menu_open   = true,
                     callback         = function() self:_editPort() end,
@@ -832,18 +1207,18 @@ function WireGuard:addToMainMenu(menu_items)
                                 "WireGuard VPN Plugin\n\n" ..
                                 "Tunnels KOReader's network traffic through a " ..
                                 "WireGuard VPN using wireproxy (github.com/whyvl/wireproxy) " ..
-                                "as a local SOCKS5 proxy.\n\n" ..
+                                "as a local HTTP CONNECT proxy.\n\n" ..
                                 "Setup:\n" ..
                                 "  1. Obtain a wireproxy binary for your device\n" ..
                                 "     architecture (ARM, ARM64, x86, x86_64).\n" ..
                                 "  2. Copy your WireGuard .conf file to the device.\n" ..
                                 "  3. Use this menu to point the plugin to both files.\n" ..
                                 "  4. Toggle 'Enable WireGuard VPN'.\n\n" ..
-                                "The plugin appends a [Socks5] section to a\n" ..
+                                "The plugin appends an [http] section to a\n" ..
                                 "temporary copy of your config and launches\n" ..
-                                "wireproxy in the background.  http_proxy,\n" ..
-                                "https_proxy and ALL_PROXY environment variables\n" ..
-                                "are set so KOReader routes through the tunnel.\n\n" ..
+                                "wireproxy in the background.  KOReader's HTTP\n" ..
+                                "proxy is configured via NetworkMgr so that\n" ..
+                                "LuaSocket routes through the tunnel.\n\n" ..
                                 "Supports Android 4.4 and later."
                             ),
                         })
