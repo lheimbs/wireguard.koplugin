@@ -290,7 +290,6 @@ function WireGuard:_logStartupDiagnostics(binary_path, pid)
     local name = _basename(binary_path) or "wireproxy"
     self:_log("DEBUG", "--- wireproxy startup diagnostics begin ---")
     local checks = {
-        { "which-nohup", "command -v nohup || true" },
         { "which-sh", "command -v sh || true" },
         { "which-nc", "command -v nc || true" },
         { "binary-ls", string.format("ls -ahl %q || true", binary_path) },
@@ -624,14 +623,14 @@ function WireGuard:_startWireproxy()
         pcall(ffi.C.setenv, "LD_LIBRARY_PATH", android.nativeLibraryDir, 1)
         has_custom_ld_library_path = true
         cmd = string.format(
-            "nohup %q -c %q >%q 2>&1 </dev/null & echo $! >%q",
+            "%q -c %q >%q 2>&1 </dev/null & echo $! >%q",
             binary_path,
             RUNTIME_CONF_FILE,
             WIREPROXY_LOG_FILE,
             PID_FILE)
     else
         cmd = string.format(
-            "nohup %q -c %q >%q 2>&1 </dev/null & echo $! >%q",
+            "%q -c %q >%q 2>&1 </dev/null & echo $! >%q",
             binary_path,
             RUNTIME_CONF_FILE,
             WIREPROXY_LOG_FILE,
