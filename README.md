@@ -6,6 +6,9 @@ using [wireproxy](https://github.com/whyvl/wireproxy) as a local HTTP CONNECT
 proxy.
 
 ---
+⚠️ Warning: this is AI generated code and thus prototype level!
+Use at your own risk.
+---
 
 ## Android version requirements
 
